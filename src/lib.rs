@@ -13,7 +13,9 @@ pub mod agent;
 pub mod bridge;
 pub mod error;
 pub mod newtype;
+pub mod provider;
 pub mod tui;
+pub mod wire;
 
 pub use error::{BridgeError, Error, ProviderError, SseError, TuiError, WireError};
 pub use newtype::{

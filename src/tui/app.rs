@@ -19,13 +19,19 @@ pub enum Mode {
     Quitting,
 }
 
-/// Side effect the frame loop must perform after this transition.
+/// Side effect the frame loop must perform after this transition.  Always
+/// returned (never wrapped in `Option`) so the dispatch match in
+/// `frame::step_one_frame` is exhaustive on a real enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppEffect {
+    /// No side effect needed.
+    NoOp,
     /// Signal the producer fiber via the cancel channel.
     SignalCancel,
-    /// Send the current input buffer to a (future) producer.  Phase A only
-    /// emits this as a stub; main.rs ignores it for now.
+    /// Submit the latest user message to a fresh producer fiber.  The frame
+    /// loop reads the message from `AppState::history()` (the latest `User`
+    /// entry) rather than threading it through this enum, which keeps
+    /// `AppEffect` `Copy` and avoids carrying ownership.
     SendInput,
 }
 
@@ -35,22 +41,20 @@ pub struct AppState {
     history: ChatHistory,
     input: InputBuffer,
     mode: Mode,
-    pending_send: Option<MessageBody>,
 }
 
 impl AppState {
-    /// Initial state: empty history, empty input, idle, no pending send.
+    /// Initial state: empty history, empty input, idle.
     #[must_use]
     pub fn initial() -> Self {
         Self {
             history: ChatHistory::empty(),
             input: InputBuffer::empty(),
             mode: Mode::Idle,
-            pending_send: None,
         }
     }
 
-    /// View the history (for rendering).
+    /// View the history (for rendering and wire-message derivation).
     #[must_use]
     pub fn history(&self) -> &ChatHistory {
         &self.history
@@ -74,68 +78,45 @@ impl AppState {
         matches!(self.mode, Mode::Quitting)
     }
 
-    /// The body the caller should hand to the next producer.  Only the
-    /// `SendInput` effect makes this `Some`; the frame loop consumes it.
-    #[must_use]
-    pub fn take_pending_send(self) -> (Option<MessageBody>, Self) {
-        let Self {
-            history,
-            input,
-            mode,
-            pending_send,
-        } = self;
-        (
-            pending_send,
-            Self {
-                history,
-                input,
-                mode,
-                pending_send: None,
-            },
-        )
-    }
-
     /// Fold a `KeyAction` into the state.  Returns the new state and an
-    /// optional `AppEffect` the caller must interpret.  Dispatches on the
-    /// current mode to a per-mode helper; this keeps every match exhaustive
-    /// on enums without resorting to `_` wildcards.
+    /// effect the caller must interpret.  Dispatches on mode to per-mode
+    /// helpers so every match is exhaustive on enums with no `_` wildcards.
     #[must_use]
-    pub fn apply_key(self, action: KeyAction) -> (Self, Option<AppEffect>) {
+    pub fn apply_key(self, action: KeyAction) -> (Self, AppEffect) {
         match self.mode {
-            Mode::Quitting => (self, None),
+            Mode::Quitting => (self, AppEffect::NoOp),
             Mode::Idle => self.apply_key_idle(action),
             Mode::Streaming => self.apply_key_streaming(action),
         }
     }
 
-    fn apply_key_idle(self, action: KeyAction) -> (Self, Option<AppEffect>) {
+    fn apply_key_idle(self, action: KeyAction) -> (Self, AppEffect) {
         match action {
             KeyAction::Quit => (
                 Self {
                     mode: Mode::Quitting,
                     ..self
                 },
-                None,
+                AppEffect::NoOp,
             ),
             KeyAction::Send => self.apply_send_idle(),
-            KeyAction::NewLine => (self.map_input(InputBuffer::insert_newline), None),
-            KeyAction::Backspace => (self.map_input(InputBuffer::backspace), None),
-            KeyAction::DeleteWord => (self.map_input(InputBuffer::delete_word), None),
-            KeyAction::Char(c) => (self.map_input(move |i| i.insert_char(c)), None),
-            KeyAction::Up => (self.scroll_history_up(1), None),
-            KeyAction::Down => (self.scroll_history_down(1), None),
-            KeyAction::PageUp => (self.scroll_history_up(10), None),
-            KeyAction::PageDown => (self.scroll_history_down(10), None),
-            KeyAction::Cancel | KeyAction::NoOp => (self, None),
+            KeyAction::NewLine => (self.map_input(InputBuffer::insert_newline), AppEffect::NoOp),
+            KeyAction::Backspace => (self.map_input(InputBuffer::backspace), AppEffect::NoOp),
+            KeyAction::DeleteWord => (self.map_input(InputBuffer::delete_word), AppEffect::NoOp),
+            KeyAction::Char(c) => (self.map_input(move |i| i.insert_char(c)), AppEffect::NoOp),
+            KeyAction::Up => (self.scroll_history_up(1), AppEffect::NoOp),
+            KeyAction::Down => (self.scroll_history_down(1), AppEffect::NoOp),
+            KeyAction::PageUp => (self.scroll_history_up(10), AppEffect::NoOp),
+            KeyAction::PageDown => (self.scroll_history_down(10), AppEffect::NoOp),
+            KeyAction::Cancel | KeyAction::NoOp => (self, AppEffect::NoOp),
         }
     }
 
-    fn apply_send_idle(self) -> (Self, Option<AppEffect>) {
+    fn apply_send_idle(self) -> (Self, AppEffect) {
         let Self {
             history,
             input,
             mode: _,
-            pending_send: _,
         } = self;
         if input.is_empty() {
             (
@@ -143,21 +124,19 @@ impl AppState {
                     history,
                     input,
                     mode: Mode::Idle,
-                    pending_send: None,
                 },
-                None,
+                AppEffect::NoOp,
             )
         } else {
             let (body, next_input) = input.take();
-            let history = history.push_user(body.clone());
+            let history = history.push_user(body);
             (
                 Self {
                     history,
                     input: next_input,
                     mode: Mode::Streaming,
-                    pending_send: Some(body),
                 },
-                Some(AppEffect::SendInput),
+                AppEffect::SendInput,
             )
         }
     }
@@ -167,33 +146,29 @@ impl AppState {
             history,
             input,
             mode,
-            pending_send,
         } = self;
         Self {
             history,
             input: f(input),
             mode,
-            pending_send,
         }
     }
 
-    fn apply_key_streaming(self, action: KeyAction) -> (Self, Option<AppEffect>) {
+    fn apply_key_streaming(self, action: KeyAction) -> (Self, AppEffect) {
         match action {
             KeyAction::Quit => {
                 let Self {
                     history,
                     input,
                     mode: _,
-                    pending_send,
                 } = self;
                 (
                     Self {
                         history,
                         input,
                         mode: Mode::Quitting,
-                        pending_send,
                     },
-                    Some(AppEffect::SignalCancel),
+                    AppEffect::SignalCancel,
                 )
             }
             KeyAction::Cancel => {
@@ -201,7 +176,6 @@ impl AppState {
                     history,
                     input,
                     mode: _,
-                    pending_send,
                 } = self;
                 let history = history.finalize_assistant();
                 (
@@ -209,21 +183,20 @@ impl AppState {
                         history,
                         input,
                         mode: Mode::Idle,
-                        pending_send,
                     },
-                    Some(AppEffect::SignalCancel),
+                    AppEffect::SignalCancel,
                 )
             }
-            KeyAction::Up => (self.scroll_history_up(1), None),
-            KeyAction::Down => (self.scroll_history_down(1), None),
-            KeyAction::PageUp => (self.scroll_history_up(10), None),
-            KeyAction::PageDown => (self.scroll_history_down(10), None),
+            KeyAction::Up => (self.scroll_history_up(1), AppEffect::NoOp),
+            KeyAction::Down => (self.scroll_history_down(1), AppEffect::NoOp),
+            KeyAction::PageUp => (self.scroll_history_up(10), AppEffect::NoOp),
+            KeyAction::PageDown => (self.scroll_history_down(10), AppEffect::NoOp),
             KeyAction::Send
             | KeyAction::NewLine
             | KeyAction::Backspace
             | KeyAction::DeleteWord
             | KeyAction::Char(_)
-            | KeyAction::NoOp => (self, None),
+            | KeyAction::NoOp => (self, AppEffect::NoOp),
         }
     }
 
@@ -232,13 +205,11 @@ impl AppState {
             history,
             input,
             mode,
-            pending_send,
         } = self;
         Self {
             history: history.scroll_up(delta),
             input,
             mode,
-            pending_send,
         }
     }
 
@@ -247,13 +218,11 @@ impl AppState {
             history,
             input,
             mode,
-            pending_send,
         } = self;
         Self {
             history: history.scroll_down(delta),
             input,
             mode,
-            pending_send,
         }
     }
 
@@ -266,13 +235,11 @@ impl AppState {
                     history,
                     input,
                     mode: _,
-                    pending_send,
                 } = self;
                 Self {
                     history: history.extend_assistant_partial(&body),
                     input,
                     mode: Mode::Streaming,
-                    pending_send,
                 }
             }
             AgentEvent::TurnDone => {
@@ -280,13 +247,11 @@ impl AppState {
                     history,
                     input,
                     mode: _,
-                    pending_send,
                 } = self;
                 Self {
                     history: history.finalize_assistant(),
                     input,
                     mode: Mode::Idle,
-                    pending_send,
                 }
             }
             AgentEvent::ToolInvoked { name, args } => {
@@ -296,13 +261,11 @@ impl AppState {
                     history,
                     input,
                     mode,
-                    pending_send,
                 } = self;
                 Self {
                     history: history.push_tool_invoked(summary),
                     input,
                     mode,
-                    pending_send,
                 }
             }
             AgentEvent::ToolReturned { name, result } => {
@@ -312,13 +275,11 @@ impl AppState {
                     history,
                     input,
                     mode,
-                    pending_send,
                 } = self;
                 Self {
                     history: history.push_tool_returned(summary),
                     input,
                     mode,
-                    pending_send,
                 }
             }
             AgentEvent::Failure(msg) => {
@@ -326,13 +287,11 @@ impl AppState {
                     history,
                     input,
                     mode: _,
-                    pending_send,
                 } = self;
                 Self {
                     history: history.push_error(msg),
                     input,
                     mode: Mode::Idle,
-                    pending_send,
                 }
             }
         }

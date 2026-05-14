@@ -1,77 +1,78 @@
-//! Producer-fiber spawning.  Phase A ships only the mock producer; Phase C
-//! will introduce `spawn_agent_turn` driving a real `StreamingAgent::turn`
-//! stream.
+//! Producer-fiber spawning.  Phase B drives the blocking
+//! `LocalOpenAiCompletion::complete`; Phase C will replace this with a
+//! streaming `StreamingAgent::turn` driver.
 
+use std::convert::Infallible;
 use std::sync::mpsc::Sender;
-use std::time::Duration;
 
 use comp_cat_rs::effect::fiber::{Fiber, FiberError};
 use comp_cat_rs::effect::io::Io;
 
 use crate::agent::AgentEvent;
-use crate::bridge::cancel::CancelObserver;
-use crate::error::{BridgeError, Error};
+use crate::error::Error;
 use crate::newtype::MessageBody;
+use crate::provider::LocalOpenAiCompletion;
+use crate::tui::history::{ChatHistory, HistoryEntry};
+use crate::wire::Message;
 
-/// Spawn a fiber that emits a fixed sequence of `AssistantToken` events
-/// followed by `TurnDone`.  Sleeps 200 ms between tokens to simulate streaming.
-///
-/// The fiber observes `cancel` and stops cleanly as soon as a signal arrives.
-/// Use this in Phase A to exercise the TUI without a real LLM.
+/// Spawn a fiber that issues one blocking chat-completion request, sends the
+/// resulting assistant body as `AgentEvent::AssistantToken`, and emits
+/// `AgentEvent::TurnDone`.  On error, sends `AgentEvent::Failure` followed by
+/// `AgentEvent::TurnDone`.  No streaming yet; Phase C splits the body into
+/// per-chunk tokens.
 ///
 /// # Errors
 ///
-/// Returns a `FiberError` if the OS thread cannot be spawned.  Once running,
-/// per-token send failures abort the fiber with `BridgeError::SendDisconnected`.
+/// Returns `FiberError::SpawnFailed` if the OS thread cannot be created.
 #[must_use]
-pub fn spawn_mock_producer(
-    tx: Sender<AgentEvent>,
-    cancel: CancelObserver,
+pub fn spawn_completion_fiber(
+    provider: &LocalOpenAiCompletion,
+    messages: Vec<Message>,
+    tx: &Sender<AgentEvent>,
 ) -> Io<FiberError<Error>, Fiber<Error, ()>> {
-    Fiber::fork(Io::suspend(move || {
-        let words: Vec<&'static str> = vec![
-            "Hello,",
-            " world!",
-            "  ",
-            "This",
-            " is",
-            " a",
-            " mock",
-            " stream",
-            " emitting",
-            " one",
-            " token",
-            " every",
-            " 200",
-            " milliseconds.",
-            "  ",
-            "Press",
-            " Esc",
-            " to",
-            " cancel,",
-            " or",
-            " wait",
-            " for",
-            " TurnDone.",
-        ];
+    let tx_for_send = tx.clone();
+    let work: Io<Error, ()> = provider
+        .complete(messages)
+        .attempt()
+        .map(move |result| {
+            let event = result.map_or_else(
+                |e: Error| AgentEvent::Failure(MessageBody::new(format!("{e}"))),
+                AgentEvent::AssistantToken,
+            );
+            let _ = tx_for_send.send(event);
+            let _ = tx_for_send.send(AgentEvent::TurnDone);
+        })
+        .map_error(infallible_to_error);
 
-        let stopped = words
-            .iter()
-            .try_fold(false, |stopped, word| -> Result<bool, Error> {
-                if stopped || cancel.is_cancelled() {
-                    Ok(true)
-                } else {
-                    std::thread::sleep(Duration::from_millis(200));
-                    let token = MessageBody::new((*word).to_owned());
-                    tx.send(AgentEvent::AssistantToken(token))
-                        .map_err(|_| Error::Bridge(BridgeError::SendDisconnected))?;
-                    Ok(false)
-                }
-            })?;
+    Fiber::fork(work)
+}
 
-        if !stopped {
-            let _ = tx.send(AgentEvent::TurnDone);
-        }
-        Ok(())
-    }))
+/// Vacuous lift from the empty `Infallible` type into our `Error` enum.  Used
+/// to translate the type signature of `Io::attempt` (which returns
+/// `Io<Infallible, _>`) back into our project-wide `Error`.  The body of this
+/// function is unreachable at runtime: `Infallible` has zero variants, so a
+/// zero-arm match is the idiomatic, panic-free encoding.
+fn infallible_to_error(i: Infallible) -> Error {
+    match i {}
+}
+
+/// Project the user-visible `ChatHistory` into the wire-message format the
+/// OpenAI-compatible API expects.  `AssistantPartial`, `ToolInvoked`,
+/// `ToolReturned`, and `Error` history entries are skipped: they are UI
+/// concerns, not protocol-level messages.  Phase D will lift `ToolInvoked` /
+/// `ToolReturned` into proper `assistant_tool_calls` / `tool` wire messages.
+#[must_use]
+pub fn history_to_wire(history: &ChatHistory) -> Vec<Message> {
+    history
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            HistoryEntry::User(body) => Some(Message::user(body.clone())),
+            HistoryEntry::AssistantComplete(body) => Some(Message::assistant(body.clone())),
+            HistoryEntry::AssistantPartial(_)
+            | HistoryEntry::ToolInvoked(_)
+            | HistoryEntry::ToolReturned(_)
+            | HistoryEntry::Error(_) => None,
+        })
+        .collect()
 }

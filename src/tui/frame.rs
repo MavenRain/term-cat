@@ -5,7 +5,7 @@
 
 use std::io::{Stdout, stdout};
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use comp_cat_rs::effect::io::Io;
@@ -18,20 +18,25 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::agent::AgentEvent;
-use crate::bridge::Canceller;
+use crate::bridge::{Canceller, history_to_wire, spawn_completion_fiber};
 use crate::error::{Error, TuiError};
+use crate::newtype::MessageBody;
+use crate::provider::LocalOpenAiCompletion;
 use crate::tui::app::{AppEffect, AppState};
 use crate::tui::key;
 use crate::tui::render;
 
 /// State threaded through one frame.  The `Terminal` is moved each iteration
 /// because `Terminal::draw` requires `&mut self`; this is the FFI carve-out
-/// for ratatui.
+/// for ratatui.  `provider` and `tx` are owned by the loop so the
+/// `SendInput` effect can spawn a fresh per-turn completion fiber.
 struct FrameState {
     app: AppState,
     terminal: Terminal<CrosstermBackend<Stdout>>,
     rx: Receiver<AgentEvent>,
     canceller: Canceller,
+    provider: LocalOpenAiCompletion,
+    tx: Sender<AgentEvent>,
 }
 
 /// Type of the per-frame unfold step closure used by the TUI frame `Stream`.
@@ -49,11 +54,21 @@ type FoldFn = Arc<dyn Fn((), ()) + Send + Sync>;
 ///
 /// Returns `Error::Tui` if terminal setup, draw, or input polling fails.
 #[must_use]
-pub fn run(rx: Receiver<AgentEvent>, canceller: Canceller) -> Io<Error, ()> {
-    Io::suspend(move || run_inner(rx, canceller))
+pub fn run(
+    provider: LocalOpenAiCompletion,
+    tx: Sender<AgentEvent>,
+    rx: Receiver<AgentEvent>,
+    canceller: Canceller,
+) -> Io<Error, ()> {
+    Io::suspend(move || run_inner(provider, tx, rx, canceller))
 }
 
-fn run_inner(rx: Receiver<AgentEvent>, canceller: Canceller) -> Result<(), Error> {
+fn run_inner(
+    provider: LocalOpenAiCompletion,
+    tx: Sender<AgentEvent>,
+    rx: Receiver<AgentEvent>,
+    canceller: Canceller,
+) -> Result<(), Error> {
     let _guard = RawModeGuard::enter().map_err(Error::Tui)?;
 
     let backend = CrosstermBackend::new(stdout());
@@ -64,6 +79,8 @@ fn run_inner(rx: Receiver<AgentEvent>, canceller: Canceller) -> Result<(), Error
         terminal,
         rx,
         canceller,
+        provider,
+        tx,
     };
 
     let step: StepFn = Arc::new(|state: FrameState| Io::suspend(move || step_one_frame(state)));
@@ -80,6 +97,8 @@ fn step_one_frame(state: FrameState) -> Result<Option<((), FrameState)>, Error> 
         mut terminal,
         rx,
         canceller,
+        provider,
+        tx,
     } = state;
 
     let app = rx.try_iter().fold(app, AppState::apply_agent_event);
@@ -94,20 +113,26 @@ fn step_one_frame(state: FrameState) -> Result<Option<((), FrameState)>, Error> 
         let raw = crossterm::event::read().map_err(|e| Error::Tui(TuiError::Io(e)))?;
         app.apply_key(key::lift(&raw))
     } else {
-        (app, None)
+        (app, AppEffect::NoOp)
     };
 
-    // `Option::map` for the side effect: the user's conventions forbid
-    // `if let` / `match` on `Option`, and `iter().for_each` would trigger
-    // clippy::needless_for_each.  Discard the `Option<()>` after the
-    // side effect runs.
-    let _ = effect.map(|e| match e {
+    match effect {
+        AppEffect::NoOp => {}
         AppEffect::SignalCancel => canceller.signal(),
         AppEffect::SendInput => {
-            // Phase A: nothing wired up to consume the send.  Phase B/C will
-            // spawn a fresh producer fiber here.
+            let messages = history_to_wire(app.history());
+            let fork_result = spawn_completion_fiber(&provider, messages, &tx).run();
+            // On spawn failure we synthesize a Failure + TurnDone so the UI
+            // returns to Idle and shows the error.  The TUI drains these on
+            // the next frame.
+            let _ = fork_result.map_err(|fe| {
+                let _ = tx.send(AgentEvent::Failure(MessageBody::new(format!(
+                    "fiber spawn failed: {fe:?}"
+                ))));
+                let _ = tx.send(AgentEvent::TurnDone);
+            });
         }
-    });
+    }
 
     if app.is_quit() {
         Ok(None)
@@ -119,6 +144,8 @@ fn step_one_frame(state: FrameState) -> Result<Option<((), FrameState)>, Error> 
                 terminal,
                 rx,
                 canceller,
+                provider,
+                tx,
             },
         )))
     }

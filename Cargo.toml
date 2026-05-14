@@ -1,0 +1,27 @@
+[package]
+name = "term-cat"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Claude-like terminal UI for local OpenAI-compatible LLM servers, built on comp-cat-rs and rig-cat."
+repository = "https://github.com/MavenRain/term-cat"
+authors = ["Onyeka Obi"]
+keywords = ["tui", "llm", "category-theory", "effects", "openai"]
+categories = ["command-line-utilities", "rust-patterns"]
+readme = "README.md"
+
+[dependencies]
+comp-cat-rs = "=0.5.1"
+rig-cat     = "=0.1.2"
+ratatui     = "=0.30.0"
+crossterm   = "=0.29.0"
+ureq        = { version = "=3.3.0", features = ["json"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all      = "deny"
+pedantic = "warn"

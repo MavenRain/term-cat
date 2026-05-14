@@ -42,10 +42,6 @@ cargo run --release -- --model your-loaded-model-id
 | Esc                  | Cancel an in-flight stream        |
 | Ctrl+C / Ctrl+D      | Quit when idle                    |
 
-## Architecture
-
-See `CLAUDE.md` for the rules the codebase follows, and the design plan at the top of `src/lib.rs`.
-
 ## Roadmap
 
 Out of v1: markdown rendering with syntax highlighting, slash commands (`/clear`, `/save`, `/load`, `/model`), conversation persistence, image / file attachments, RAG.

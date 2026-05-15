@@ -21,8 +21,10 @@ pub fn root(f: &mut Frame<'_>, state: &AppState) {
         ])
         .split(f.area());
 
-    let history_pane = history_widget(state);
     let history_area = chunks.first().copied().unwrap_or_default();
+    // Inner height = block area minus top and bottom borders (Borders::ALL).
+    let history_inner_height = history_area.height.saturating_sub(2);
+    let history_pane = history_widget(state, history_inner_height);
     f.render_widget(history_pane, history_area);
 
     let input_pane = input_widget(state);
@@ -34,18 +36,24 @@ pub fn root(f: &mut Frame<'_>, state: &AppState) {
     f.render_widget(footer, footer_area);
 }
 
-fn history_widget<'a>(state: &'a AppState) -> Paragraph<'a> {
+fn history_widget<'a>(state: &'a AppState, viewport_height: u16) -> Paragraph<'a> {
     let entries = state.history().entries();
     let lines: Vec<Line<'a>> = entries.iter().flat_map(entry_to_lines).collect();
-    let offset = state.history().scroll_offset();
     let total = lines.len();
-    let take_lines = lines
-        .into_iter()
-        .take(total.saturating_sub(offset))
-        .collect::<Vec<_>>();
-    Paragraph::new(take_lines)
+    let viewport = usize::from(viewport_height);
+    let user_offset = state.history().scroll_offset();
+    // Auto-scroll-to-bottom: scroll = max(0, total - viewport).  The user's
+    // `scroll_offset` (lines from the bottom) walks the view back toward
+    // older content.  Logical-line approximation: this does not account
+    // for `Wrap` re-wrapping long lines to multiple display lines, so for
+    // very wide content the bottom-alignment may be off by one or two
+    // display lines.  Good enough for v1.
+    let scroll_y = total.saturating_sub(viewport).saturating_sub(user_offset);
+    let scroll_y_u16 = u16::try_from(scroll_y).unwrap_or(u16::MAX);
+    Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(" term-cat "))
         .wrap(Wrap { trim: false })
+        .scroll((scroll_y_u16, 0))
 }
 
 fn entry_to_lines(entry: &HistoryEntry) -> Vec<Line<'_>> {

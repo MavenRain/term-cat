@@ -198,6 +198,52 @@ impl LocalOpenAiCompletion {
         let step_fn: StreamChatStepFn = Arc::new(stream_chat_step);
         Stream::unfold(init, step_fn)
     }
+
+    /// Open a streaming chat-completion request from a fully-formed
+    /// `ChatCompletionRequest`, returning the resulting `SseState` for direct
+    /// consumption.  Used by the agent's tool-calling loop, which needs to
+    /// build a request with `tools[]` populated and then step the SSE parser
+    /// itself (so it can observe finish reasons and dispatch tools).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Wire` on encode failure or `Error::Provider` on
+    /// transport / status failure.
+    #[must_use]
+    pub fn open_request(
+        &self,
+        request: ChatCompletionRequest,
+        cancel: CancelObserver,
+    ) -> Io<Error, SseState> {
+        let url = format!("{}/chat/completions", self.base_url.as_str());
+        let api_key = self.api_key.clone();
+        Io::suspend(move || open_with_request(&url, api_key.as_ref(), &request, cancel))
+    }
+}
+
+fn open_with_request(
+    url: &str,
+    api_key: Option<&ApiKey>,
+    request: &ChatCompletionRequest,
+    cancel: CancelObserver,
+) -> Result<SseState, Error> {
+    let json_body =
+        serde_json::to_string(request).map_err(|e| Error::Wire(WireError::Encode(e)))?;
+
+    let builder = api_key.iter().fold(
+        ureq::post(url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream"),
+        |b, k| b.header("Authorization", format!("Bearer {}", k.as_str())),
+    );
+
+    let response = builder
+        .send(json_body)
+        .map_err(|e| Error::Provider(ProviderError::Http(e)))?;
+    let response = check_status(response)?;
+
+    let reader = BufReader::new(response.into_body().into_reader());
+    Ok(SseState::new(reader, cancel))
 }
 
 fn stream_chat_step(state: StreamChatState) -> Io<Error, Option<(ChatEvent, StreamChatState)>> {
@@ -212,8 +258,10 @@ fn lift_sse_to_chat(opt: Option<(ChatEvent, SseState)>) -> Option<(ChatEvent, St
     opt.map(|(event, next)| (event, StreamChatState::Active(next)))
 }
 
-/// Build the request, POST it with `stream: true`, status-check, and wrap the
-/// response body in an `SseState` ready for `sse::step`.
+/// Build the request from a `StreamPending`, POST it with `stream: true`,
+/// status-check, and wrap the response body in an `SseState`.  Delegates to
+/// `open_with_request` (which is also used directly by the agent loop's
+/// tools-aware path).
 fn open_streaming(p: StreamPending) -> Result<SseState, Error> {
     let StreamPending {
         url,
@@ -230,23 +278,7 @@ fn open_streaming(p: StreamPending) -> Result<SseState, Error> {
         .maybe_max_tokens(max_tokens)
         .with_stream(true);
 
-    let json_body =
-        serde_json::to_string(&request).map_err(|e| Error::Wire(WireError::Encode(e)))?;
-
-    let builder = api_key.iter().fold(
-        ureq::post(&url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream"),
-        |b, k| b.header("Authorization", format!("Bearer {}", k.as_str())),
-    );
-
-    let response = builder
-        .send(json_body)
-        .map_err(|e| Error::Provider(ProviderError::Http(e)))?;
-    let response = check_status(response)?;
-
-    let reader = BufReader::new(response.into_body().into_reader());
-    Ok(SseState::new(reader, cancel))
+    open_with_request(&url, api_key.as_ref(), &request, cancel)
 }
 
 /// Drain the response body into a `String`, returning a sentinel on failure

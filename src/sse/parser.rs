@@ -51,6 +51,14 @@ impl SseState {
             cancel,
         }
     }
+
+    /// Consume the state and return the cancel observer.  Used by the agent
+    /// loop when transitioning out of the streaming phase between tool
+    /// dispatches so the same observer continues to gate the next HTTP call.
+    #[must_use]
+    pub fn into_cancel(self) -> CancelObserver {
+        self.cancel
+    }
 }
 
 /// Possible classifications of one SSE line.

@@ -3,12 +3,9 @@
 //! is acquired and released by a `RawModeGuard` whose `Drop` runs even if the
 //! frame loop returns an error.
 //!
-//! Phase C: each user turn mints its own `cancel_channel()`.  The frame loop
-//! keeps the `Canceller` while a stream is in flight and drops it as soon as
-//! the app transitions away from `Mode::Streaming`.  Dropping the `Canceller`
-//! is itself observable: the producer's `CancelObserver::is_cancelled` returns
-//! `true` once the channel disconnects, which lets the SSE reader unwind on
-//! TUI shutdown even if `Esc` was never pressed.
+//! Phase D: the frame loop owns a `StreamingAgent<T>`.  Each user turn clones
+//! the agent and spawns a fiber driving `spawn_agent_turn`, which forwards
+//! `AgentEvent`s to the UI mpsc channel.
 
 use std::io::{Stdout, stdout};
 use std::sync::Arc;
@@ -23,35 +20,33 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use rig_cat::tool::Tool;
 
-use crate::agent::AgentEvent;
-use crate::bridge::{Canceller, cancel_channel, history_to_wire, spawn_streaming_fiber};
+use crate::agent::{AgentEvent, StreamingAgent};
+use crate::bridge::{Canceller, cancel_channel, history_to_wire, spawn_agent_turn};
 use crate::error::{Error, TuiError};
 use crate::newtype::MessageBody;
-use crate::provider::LocalOpenAiCompletion;
 use crate::tui::app::{AppEffect, AppState, Mode};
 use crate::tui::key;
 use crate::tui::render;
 
-/// State threaded through one frame.  The `Terminal` is moved each iteration
-/// because `Terminal::draw` requires `&mut self`; this is the FFI carve-out
-/// for ratatui.  `current_canceller` is `Some` exactly when an SSE fiber is
-/// in flight.
-struct FrameState {
+/// State threaded through one frame.  Generic over the tool dispatcher type
+/// `T` so the binary can plug in either `BuiltinTool` (the default) or any
+/// custom user-defined tool enum.
+struct FrameState<T: Tool + Clone + Send + Sync + 'static> {
     app: AppState,
     terminal: Terminal<CrosstermBackend<Stdout>>,
     rx: Receiver<AgentEvent>,
     current_canceller: Option<Canceller>,
-    provider: LocalOpenAiCompletion,
+    agent: StreamingAgent<T>,
     tx: Sender<AgentEvent>,
 }
 
-/// Type of the per-frame unfold step closure used by the TUI frame `Stream`.
-type StepFn = Arc<dyn Fn(FrameState) -> Io<Error, Option<((), FrameState)>> + Send + Sync>;
+/// Type of the per-frame unfold step closure.  Parameterized by `T` so the
+/// dyn-trait stays static-dispatchable from the caller's perspective.
+type StepFn<T> = Arc<dyn Fn(FrameState<T>) -> Io<Error, Option<((), FrameState<T>)>> + Send + Sync>;
 
-/// Type of the accumulator-discarding fold closure used to drain the frame
-/// stream.  The two `()` arguments are the accumulator and the per-frame
-/// element; the return type is the unit accumulator.
+/// Type of the fold closure that drains the frame stream.
 type FoldFn = Arc<dyn Fn((), ()) + Send + Sync>;
 
 /// Run the TUI: enter raw mode, drain the frame stream, then restore the
@@ -61,16 +56,16 @@ type FoldFn = Arc<dyn Fn((), ()) + Send + Sync>;
 ///
 /// Returns `Error::Tui` if terminal setup, draw, or input polling fails.
 #[must_use]
-pub fn run(
-    provider: LocalOpenAiCompletion,
+pub fn run<T: Tool + Clone + Send + Sync + 'static>(
+    agent: StreamingAgent<T>,
     tx: Sender<AgentEvent>,
     rx: Receiver<AgentEvent>,
 ) -> Io<Error, ()> {
-    Io::suspend(move || run_inner(provider, tx, rx))
+    Io::suspend(move || run_inner(agent, tx, rx))
 }
 
-fn run_inner(
-    provider: LocalOpenAiCompletion,
+fn run_inner<T: Tool + Clone + Send + Sync + 'static>(
+    agent: StreamingAgent<T>,
     tx: Sender<AgentEvent>,
     rx: Receiver<AgentEvent>,
 ) -> Result<(), Error> {
@@ -84,11 +79,12 @@ fn run_inner(
         terminal,
         rx,
         current_canceller: None,
-        provider,
+        agent,
         tx,
     };
 
-    let step: StepFn = Arc::new(|state: FrameState| Io::suspend(move || step_one_frame(state)));
+    let step: StepFn<T> =
+        Arc::new(|state: FrameState<T>| Io::suspend(move || step_one_frame(state)));
     let frames = Stream::unfold(init, step);
     let fold_fn: FoldFn = Arc::new(|(), ()| ());
     let drain: Io<Error, ()> = frames.fold((), fold_fn);
@@ -96,13 +92,15 @@ fn run_inner(
     drain.run()
 }
 
-fn step_one_frame(state: FrameState) -> Result<Option<((), FrameState)>, Error> {
+fn step_one_frame<T: Tool + Clone + Send + Sync + 'static>(
+    state: FrameState<T>,
+) -> Result<Option<((), FrameState<T>)>, Error> {
     let FrameState {
         app,
         mut terminal,
         rx,
         current_canceller,
-        provider,
+        agent,
         tx,
     } = state;
 
@@ -127,7 +125,7 @@ fn step_one_frame(state: FrameState) -> Result<Option<((), FrameState)>, Error> 
             current_canceller.iter().for_each(Canceller::signal);
             current_canceller
         }
-        AppEffect::SendInput => spawn_turn(&provider, &tx, app.history(), &rx),
+        AppEffect::SendInput => spawn_turn(&agent, &tx, app.history()),
     };
 
     // After every transition, the canceller is alive iff the app is still
@@ -149,26 +147,25 @@ fn step_one_frame(state: FrameState) -> Result<Option<((), FrameState)>, Error> 
                 terminal,
                 rx,
                 current_canceller,
-                provider,
+                agent,
                 tx,
             },
         )))
     }
 }
 
-/// Mint a fresh `cancel_channel`, spawn a streaming fiber, and return the
-/// new `Canceller`.  On spawn failure we synthesize `Failure + TurnDone`
-/// events via `tx` so the UI returns to Idle and surfaces the error; the
-/// returned `Option<Canceller>` is `None` in that case.
-fn spawn_turn(
-    provider: &LocalOpenAiCompletion,
+/// Mint a fresh `cancel_channel`, clone the agent for the new turn, and spawn
+/// the fiber.  On spawn failure we synthesize `Failure + TurnDone` events via
+/// `tx` so the UI returns to Idle and surfaces the error.
+fn spawn_turn<T: Tool + Clone + Send + Sync + 'static>(
+    agent: &StreamingAgent<T>,
     tx: &Sender<AgentEvent>,
     history: &crate::tui::history::ChatHistory,
-    _rx: &Receiver<AgentEvent>,
 ) -> Option<Canceller> {
     let messages = history_to_wire(history);
     let (canceller, observer) = cancel_channel();
-    let fork_result = spawn_streaming_fiber(provider, messages, tx, observer).run();
+    let agent_for_turn = agent.clone();
+    let fork_result = spawn_agent_turn(agent_for_turn, messages, tx, observer).run();
     fork_result.map_or_else(
         |fe| {
             let _ = tx.send(AgentEvent::Failure(MessageBody::new(format!(

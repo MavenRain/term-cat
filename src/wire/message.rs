@@ -75,6 +75,19 @@ impl Message {
         }
     }
 
+    /// An assistant turn that contains both text and tool calls.  Some models
+    /// emit explanatory text alongside the tool-call payload; this preserves
+    /// that for the wire history.
+    #[must_use]
+    pub fn assistant_text_and_tool_calls(body: MessageBody, calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: Some(body),
+            tool_call_id: None,
+            tool_calls: Some(calls),
+        }
+    }
+
     /// A tool-result message responding to a prior tool-call.  Used by
     /// Phase D's tool-calling loop.
     #[must_use]

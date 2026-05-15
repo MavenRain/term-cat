@@ -62,6 +62,7 @@ impl SseState {
 }
 
 /// Possible classifications of one SSE line.
+#[derive(Debug)]
 enum LineKind {
     /// `data: [DONE]` sentinel: stream is finished.
     Done,
@@ -183,4 +184,101 @@ fn classify_non_empty(line: &str) -> Result<LineKind, Error> {
                     .map_err(|e| Error::Sse(SseError::Decode(e)))
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LineKind, classify};
+    use crate::error::{Error, SseError};
+
+    fn must_skip(kind: &LineKind, label: &str) -> Result<(), String> {
+        match kind {
+            LineKind::SkipLine => Ok(()),
+            LineKind::Done => Err(format!("{label}: expected SkipLine, got Done")),
+            LineKind::Eof => Err(format!("{label}: expected SkipLine, got Eof")),
+            LineKind::Data(_) => Err(format!("{label}: expected SkipLine, got Data")),
+        }
+    }
+
+    fn must_done(kind: &LineKind, label: &str) -> Result<(), String> {
+        match kind {
+            LineKind::Done => Ok(()),
+            LineKind::SkipLine => Err(format!("{label}: expected Done, got SkipLine")),
+            LineKind::Eof => Err(format!("{label}: expected Done, got Eof")),
+            LineKind::Data(_) => Err(format!("{label}: expected Done, got Data")),
+        }
+    }
+
+    fn must_data(kind: &LineKind, label: &str) -> Result<(), String> {
+        match kind {
+            LineKind::Data(_) => Ok(()),
+            LineKind::SkipLine => Err(format!("{label}: expected Data, got SkipLine")),
+            LineKind::Done => Err(format!("{label}: expected Data, got Done")),
+            LineKind::Eof => Err(format!("{label}: expected Data, got Eof")),
+        }
+    }
+
+    #[test]
+    fn blank_line_is_skip() -> Result<(), String> {
+        let kind = classify("").map_err(|e| format!("classify: {e:?}"))?;
+        must_skip(&kind, "blank")
+    }
+
+    #[test]
+    fn only_newline_is_skip() -> Result<(), String> {
+        let kind = classify("\n").map_err(|e| format!("classify: {e:?}"))?;
+        must_skip(&kind, "only-newline")
+    }
+
+    #[test]
+    fn crlf_only_is_skip() -> Result<(), String> {
+        let kind = classify("\r\n").map_err(|e| format!("classify: {e:?}"))?;
+        must_skip(&kind, "crlf")
+    }
+
+    #[test]
+    fn comment_line_is_skip() -> Result<(), String> {
+        let kind = classify(": this is a heartbeat\n").map_err(|e| format!("classify: {e:?}"))?;
+        must_skip(&kind, "comment")
+    }
+
+    #[test]
+    fn id_prefix_is_skip() -> Result<(), String> {
+        let kind = classify("id: 42\n").map_err(|e| format!("classify: {e:?}"))?;
+        must_skip(&kind, "id-prefix")
+    }
+
+    #[test]
+    fn event_prefix_is_skip() -> Result<(), String> {
+        let kind = classify("event: ping\n").map_err(|e| format!("classify: {e:?}"))?;
+        must_skip(&kind, "event-prefix")
+    }
+
+    #[test]
+    fn data_done_with_space_is_done() -> Result<(), String> {
+        let kind = classify("data: [DONE]\n").map_err(|e| format!("classify: {e:?}"))?;
+        must_done(&kind, "data: [DONE]")
+    }
+
+    #[test]
+    fn data_done_without_space_is_done() -> Result<(), String> {
+        let kind = classify("data:[DONE]\n").map_err(|e| format!("classify: {e:?}"))?;
+        must_done(&kind, "data:[DONE]")
+    }
+
+    #[test]
+    fn data_with_valid_json_is_data() -> Result<(), String> {
+        let kind = classify("data: {\"choices\":[]}\n").map_err(|e| format!("classify: {e:?}"))?;
+        must_data(&kind, "data: {choices}")
+    }
+
+    #[test]
+    fn data_with_invalid_json_returns_sse_decode_error() -> Result<(), String> {
+        let result = classify("data: {this is not json}\n");
+        match result {
+            Ok(kind) => Err(format!("expected Err, got Ok({kind:?})")),
+            Err(Error::Sse(SseError::Decode(_))) => Ok(()),
+            Err(other) => Err(format!("expected SseError::Decode, got {other:?}")),
+        }
+    }
 }

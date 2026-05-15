@@ -11,10 +11,12 @@
 //! Phase B uses only `Role::{System, User, Assistant}` and ignores the tool
 //! fields.  Phase D will add tool-call constructors and tool messages.
 
+pub mod chunk;
 pub mod message;
 pub mod request;
 pub mod response;
 
+pub use chunk::ChatCompletionChunk;
 pub use message::{Message, Role, ToolCall, ToolCallFunction, ToolCallKind};
 pub use request::ChatCompletionRequest;
 pub use response::{ChatCompletionResponse, ResponseChoice, ResponseMessage};

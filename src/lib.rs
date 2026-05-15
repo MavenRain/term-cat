@@ -14,6 +14,7 @@ pub mod bridge;
 pub mod error;
 pub mod newtype;
 pub mod provider;
+pub mod sse;
 pub mod tui;
 pub mod wire;
 

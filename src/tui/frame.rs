@@ -2,6 +2,13 @@
 //! threads `FrameState` forward; `Stream::fold` drains it.  Terminal raw mode
 //! is acquired and released by a `RawModeGuard` whose `Drop` runs even if the
 //! frame loop returns an error.
+//!
+//! Phase C: each user turn mints its own `cancel_channel()`.  The frame loop
+//! keeps the `Canceller` while a stream is in flight and drops it as soon as
+//! the app transitions away from `Mode::Streaming`.  Dropping the `Canceller`
+//! is itself observable: the producer's `CancelObserver::is_cancelled` returns
+//! `true` once the channel disconnects, which lets the SSE reader unwind on
+//! TUI shutdown even if `Esc` was never pressed.
 
 use std::io::{Stdout, stdout};
 use std::sync::Arc;
@@ -18,23 +25,23 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::agent::AgentEvent;
-use crate::bridge::{Canceller, history_to_wire, spawn_completion_fiber};
+use crate::bridge::{Canceller, cancel_channel, history_to_wire, spawn_streaming_fiber};
 use crate::error::{Error, TuiError};
 use crate::newtype::MessageBody;
 use crate::provider::LocalOpenAiCompletion;
-use crate::tui::app::{AppEffect, AppState};
+use crate::tui::app::{AppEffect, AppState, Mode};
 use crate::tui::key;
 use crate::tui::render;
 
 /// State threaded through one frame.  The `Terminal` is moved each iteration
 /// because `Terminal::draw` requires `&mut self`; this is the FFI carve-out
-/// for ratatui.  `provider` and `tx` are owned by the loop so the
-/// `SendInput` effect can spawn a fresh per-turn completion fiber.
+/// for ratatui.  `current_canceller` is `Some` exactly when an SSE fiber is
+/// in flight.
 struct FrameState {
     app: AppState,
     terminal: Terminal<CrosstermBackend<Stdout>>,
     rx: Receiver<AgentEvent>,
-    canceller: Canceller,
+    current_canceller: Option<Canceller>,
     provider: LocalOpenAiCompletion,
     tx: Sender<AgentEvent>,
 }
@@ -58,16 +65,14 @@ pub fn run(
     provider: LocalOpenAiCompletion,
     tx: Sender<AgentEvent>,
     rx: Receiver<AgentEvent>,
-    canceller: Canceller,
 ) -> Io<Error, ()> {
-    Io::suspend(move || run_inner(provider, tx, rx, canceller))
+    Io::suspend(move || run_inner(provider, tx, rx))
 }
 
 fn run_inner(
     provider: LocalOpenAiCompletion,
     tx: Sender<AgentEvent>,
     rx: Receiver<AgentEvent>,
-    canceller: Canceller,
 ) -> Result<(), Error> {
     let _guard = RawModeGuard::enter().map_err(Error::Tui)?;
 
@@ -78,7 +83,7 @@ fn run_inner(
         app: AppState::initial(),
         terminal,
         rx,
-        canceller,
+        current_canceller: None,
         provider,
         tx,
     };
@@ -96,7 +101,7 @@ fn step_one_frame(state: FrameState) -> Result<Option<((), FrameState)>, Error> 
         app,
         mut terminal,
         rx,
-        canceller,
+        current_canceller,
         provider,
         tx,
     } = state;
@@ -116,23 +121,23 @@ fn step_one_frame(state: FrameState) -> Result<Option<((), FrameState)>, Error> 
         (app, AppEffect::NoOp)
     };
 
-    match effect {
-        AppEffect::NoOp => {}
-        AppEffect::SignalCancel => canceller.signal(),
-        AppEffect::SendInput => {
-            let messages = history_to_wire(app.history());
-            let fork_result = spawn_completion_fiber(&provider, messages, &tx).run();
-            // On spawn failure we synthesize a Failure + TurnDone so the UI
-            // returns to Idle and shows the error.  The TUI drains these on
-            // the next frame.
-            let _ = fork_result.map_err(|fe| {
-                let _ = tx.send(AgentEvent::Failure(MessageBody::new(format!(
-                    "fiber spawn failed: {fe:?}"
-                ))));
-                let _ = tx.send(AgentEvent::TurnDone);
-            });
+    let current_canceller: Option<Canceller> = match effect {
+        AppEffect::NoOp => current_canceller,
+        AppEffect::SignalCancel => {
+            current_canceller.iter().for_each(Canceller::signal);
+            current_canceller
         }
-    }
+        AppEffect::SendInput => spawn_turn(&provider, &tx, app.history(), &rx),
+    };
+
+    // After every transition, the canceller is alive iff the app is still
+    // actively streaming.  Drop it on Idle / Quitting so the producer fiber
+    // observes the sender disconnect and unwinds.
+    let current_canceller = if app.mode() == Mode::Streaming {
+        current_canceller
+    } else {
+        None
+    };
 
     if app.is_quit() {
         Ok(None)
@@ -143,12 +148,37 @@ fn step_one_frame(state: FrameState) -> Result<Option<((), FrameState)>, Error> 
                 app,
                 terminal,
                 rx,
-                canceller,
+                current_canceller,
                 provider,
                 tx,
             },
         )))
     }
+}
+
+/// Mint a fresh `cancel_channel`, spawn a streaming fiber, and return the
+/// new `Canceller`.  On spawn failure we synthesize `Failure + TurnDone`
+/// events via `tx` so the UI returns to Idle and surfaces the error; the
+/// returned `Option<Canceller>` is `None` in that case.
+fn spawn_turn(
+    provider: &LocalOpenAiCompletion,
+    tx: &Sender<AgentEvent>,
+    history: &crate::tui::history::ChatHistory,
+    _rx: &Receiver<AgentEvent>,
+) -> Option<Canceller> {
+    let messages = history_to_wire(history);
+    let (canceller, observer) = cancel_channel();
+    let fork_result = spawn_streaming_fiber(provider, messages, tx, observer).run();
+    fork_result.map_or_else(
+        |fe| {
+            let _ = tx.send(AgentEvent::Failure(MessageBody::new(format!(
+                "fiber spawn failed: {fe:?}"
+            ))));
+            let _ = tx.send(AgentEvent::TurnDone);
+            None
+        },
+        |_fiber| Some(canceller),
+    )
 }
 
 /// RAII guard that enters the alternate screen + raw mode on construction and

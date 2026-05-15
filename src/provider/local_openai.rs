@@ -1,18 +1,29 @@
-//! `LocalOpenAiCompletion` — a blocking, OpenAI-compatible chat-completion
-//! client backed by `ureq`.  Talks to LM Studio / `llama-server` / Ollama (via
-//! their `/v1` compat layer) at a configurable base URL.
+//! `LocalOpenAiCompletion` — an OpenAI-compatible chat-completion client
+//! backed by `ureq`.  Talks to LM Studio / `llama-server` / Ollama (via their
+//! `/v1` compat layer) at a configurable base URL.
 //!
-//! Phase B exposes only the blocking `complete` method.  Phase C will add an
-//! inherent `stream_chat` method returning `Stream<Error, ChatEvent>`.
+//! Exposes two inherent methods:
+//!
+//!   * [`LocalOpenAiCompletion::complete`] — blocking, returns the full
+//!     assistant body as one `Io<Error, MessageBody>`.  Used by callers that
+//!     do not need streaming.
+//!   * [`LocalOpenAiCompletion::stream_chat`] — streaming, returns
+//!     `Stream<Error, ChatEvent>` that emits token deltas as the server
+//!     produces them.  Cancellation is observed between SSE line reads.
 
-use std::io::Read;
+use std::io::{BufReader, Read};
+use std::sync::Arc;
 
 use comp_cat_rs::effect::io::Io;
+use comp_cat_rs::effect::stream::Stream;
 use ureq::Body;
 use ureq::http::Response;
 
+use crate::agent::ChatEvent;
+use crate::bridge::CancelObserver;
 use crate::error::{Error, ProviderError, WireError};
 use crate::newtype::{ApiKey, BaseUrl, MaxTokens, MessageBody, ModelName, Temperature};
+use crate::sse::{SseState, step as sse_step};
 use crate::wire::{ChatCompletionRequest, ChatCompletionResponse, Message};
 
 /// Blocking OpenAI-compatible chat-completion client.  Clonable so that one
@@ -129,13 +140,113 @@ impl LocalOpenAiCompletion {
 /// `Error::Provider(Status { .. })`.
 fn check_status(response: Response<Body>) -> Result<Response<Body>, Error> {
     let code = response.status().as_u16();
-    match () {
-        () if (200..300).contains(&code) => Ok(response),
-        () => {
-            let body = consume_body(response);
-            Err(Error::Provider(ProviderError::Status { code, body }))
-        }
+    if (200..300).contains(&code) {
+        Ok(response)
+    } else {
+        let body = consume_body(response);
+        Err(Error::Provider(ProviderError::Status { code, body }))
     }
+}
+
+/// Inputs captured before the streaming HTTP call is issued.  Held inside
+/// `StreamChatState::Pending` so the first unfold step can build the body,
+/// send the request, and transition to `Active`.
+struct StreamPending {
+    url: String,
+    api_key: Option<ApiKey>,
+    model: ModelName,
+    messages: Vec<Message>,
+    temperature: Option<Temperature>,
+    max_tokens: Option<MaxTokens>,
+    cancel: CancelObserver,
+}
+
+/// State threaded through the streaming chat unfold.
+enum StreamChatState {
+    /// First step: open the HTTP connection and hand off to SSE parsing.
+    Pending(StreamPending),
+    /// Steady-state: pull the next event from the SSE parser.
+    Active(SseState),
+}
+
+/// Type alias for the boxed closure used by `Stream::unfold` to drive
+/// `stream_chat`.  Factored out to keep clippy's `type_complexity` happy.
+type StreamChatStepFn =
+    Arc<dyn Fn(StreamChatState) -> Io<Error, Option<(ChatEvent, StreamChatState)>> + Send + Sync>;
+
+impl LocalOpenAiCompletion {
+    /// Issue a streaming chat-completion request and return a
+    /// `Stream<Error, ChatEvent>` that emits text and tool-call deltas as the
+    /// server produces them.  Cancellation via `cancel` is observed between
+    /// SSE line reads (~50 ms granularity in practice).
+    #[must_use]
+    pub fn stream_chat(
+        &self,
+        messages: Vec<Message>,
+        cancel: CancelObserver,
+    ) -> Stream<Error, ChatEvent> {
+        let pending = StreamPending {
+            url: format!("{}/chat/completions", self.base_url.as_str()),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            messages,
+            temperature: self.temperature,
+            max_tokens: self.max_tokens,
+            cancel,
+        };
+        let init = StreamChatState::Pending(pending);
+        let step_fn: StreamChatStepFn = Arc::new(stream_chat_step);
+        Stream::unfold(init, step_fn)
+    }
+}
+
+fn stream_chat_step(state: StreamChatState) -> Io<Error, Option<(ChatEvent, StreamChatState)>> {
+    match state {
+        StreamChatState::Pending(p) => Io::suspend(move || open_streaming(p))
+            .flat_map(|sse_state| sse_step(sse_state).map(lift_sse_to_chat)),
+        StreamChatState::Active(sse_state) => sse_step(sse_state).map(lift_sse_to_chat),
+    }
+}
+
+fn lift_sse_to_chat(opt: Option<(ChatEvent, SseState)>) -> Option<(ChatEvent, StreamChatState)> {
+    opt.map(|(event, next)| (event, StreamChatState::Active(next)))
+}
+
+/// Build the request, POST it with `stream: true`, status-check, and wrap the
+/// response body in an `SseState` ready for `sse::step`.
+fn open_streaming(p: StreamPending) -> Result<SseState, Error> {
+    let StreamPending {
+        url,
+        api_key,
+        model,
+        messages,
+        temperature,
+        max_tokens,
+        cancel,
+    } = p;
+
+    let request = ChatCompletionRequest::new(model, messages)
+        .maybe_temperature(temperature)
+        .maybe_max_tokens(max_tokens)
+        .with_stream(true);
+
+    let json_body =
+        serde_json::to_string(&request).map_err(|e| Error::Wire(WireError::Encode(e)))?;
+
+    let builder = api_key.iter().fold(
+        ureq::post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream"),
+        |b, k| b.header("Authorization", format!("Bearer {}", k.as_str())),
+    );
+
+    let response = builder
+        .send(json_body)
+        .map_err(|e| Error::Provider(ProviderError::Http(e)))?;
+    let response = check_status(response)?;
+
+    let reader = BufReader::new(response.into_body().into_reader());
+    Ok(SseState::new(reader, cancel))
 }
 
 /// Drain the response body into a `String`, returning a sentinel on failure

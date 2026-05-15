@@ -8,8 +8,13 @@
 //!      per turn (with its own cancel channel) driving the tool-calling loop.
 //!
 //! Configuration (env vars, all optional):
-//!   `TERM_CAT_BASE_URL`   default `http://localhost:1234/v1`
-//!   `TERM_CAT_MODEL`      default `local-model`
+//!   `TERM_CAT_BASE_URL`       default `http://localhost:1234/v1`
+//!   `TERM_CAT_MODEL`          default `local-model`
+//!   `TERM_CAT_DISABLE_TOOLS`  if set (to anything), skip registering the
+//!                             built-in tools.  Required when the model's
+//!                             GGUF metadata declares no tool-call support
+//!                             (e.g. supergemma4 via Ollama, which 400s any
+//!                             request with a `tools[]` field).
 
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]
@@ -32,7 +37,11 @@ fn main() -> Result<(), Error> {
         ModelName::new(env::var("TERM_CAT_MODEL").unwrap_or_else(|_| "local-model".to_owned()));
 
     let provider = LocalOpenAiCompletion::new(base_url, model);
-    let tools = vec![BuiltinTool::Echo(EchoTool), BuiltinTool::Now(NowTool)];
+    let tools: Vec<BuiltinTool> = if env::var_os("TERM_CAT_DISABLE_TOOLS").is_some() {
+        Vec::new()
+    } else {
+        vec![BuiltinTool::Echo(EchoTool), BuiltinTool::Now(NowTool)]
+    };
     let agent = StreamingAgent::new(provider, tools);
 
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>();

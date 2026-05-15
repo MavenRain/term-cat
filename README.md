@@ -34,10 +34,11 @@ cargo run --release
 
 term-cat reads two environment variables, both optional:
 
-| Variable              | Default                            | Purpose                                                      |
-|-----------------------|------------------------------------|--------------------------------------------------------------|
-| `TERM_CAT_BASE_URL`   | `http://localhost:1234/v1`         | Base URL of the OpenAI-compatible server.                    |
-| `TERM_CAT_MODEL`      | `local-model`                      | Model identifier sent in each request.  LM Studio ignores it. |
+| Variable                  | Default                            | Purpose                                                                                                                                  |
+|---------------------------|------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
+| `TERM_CAT_BASE_URL`       | `http://localhost:1234/v1`         | Base URL of the OpenAI-compatible server.                                                                                                |
+| `TERM_CAT_MODEL`          | `local-model`                      | Model identifier sent in each request.  LM Studio ignores it.                                                                            |
+| `TERM_CAT_DISABLE_TOOLS`  | unset                              | If set (to any value), skip registering the built-in tools.  Required when the server / model rejects `tools[]` (e.g. Ollama + a GGUF whose metadata declares no tool-call support). |
 
 Example:
 

@@ -10,6 +10,7 @@ use rig_cat::tool::Tool;
 use serde_json::Value;
 
 use crate::agent::accumulator::{PendingCall, ToolCallAccumulator};
+use crate::agent::channel_filter::ChannelFilter;
 use crate::agent::event::{AgentEvent, ChatEvent};
 use crate::agent::streaming::StreamingAgent;
 use crate::bridge::CancelObserver;
@@ -29,12 +30,15 @@ pub enum LoopState<T: Tool + Clone> {
         cancel: CancelObserver,
     },
     /// Mid-stream: pulling token / tool-call deltas from the SSE parser.
+    /// `filter` strips channel markers (e.g. `SuperGemma`'s `<|channel>...
+    /// <channel|>`) from the token stream before the UI sees them.
     Streaming {
         agent: StreamingAgent<T>,
         sse_state: SseState,
         accumulator: ToolCallAccumulator,
         partial_text: MessageBody,
         history: Vec<Message>,
+        filter: ChannelFilter,
     },
     /// Next yieldable event will be `AgentEvent::ToolInvoked` for `current`;
     /// the actual dispatch happens in the subsequent `DispatchTool` step.
@@ -77,7 +81,8 @@ pub fn loop_step<T: Tool + Clone + Send + Sync + 'static>(
             accumulator,
             partial_text,
             history,
-        } => step_streaming(agent, sse_state, accumulator, partial_text, history),
+            filter,
+        } => step_streaming(agent, sse_state, accumulator, partial_text, history, filter),
         LoopState::AnnouncedTool {
             agent,
             current,
@@ -112,6 +117,7 @@ fn step_fresh_request<T: Tool + Clone + Send + Sync + 'static>(
                 accumulator: ToolCallAccumulator::empty(),
                 partial_text: MessageBody::new(""),
                 history,
+                filter: ChannelFilter::new(),
             })
         })
 }
@@ -122,6 +128,7 @@ fn step_streaming<T: Tool + Clone + Send + Sync + 'static>(
     accumulator: ToolCallAccumulator,
     partial_text: MessageBody,
     history: Vec<Message>,
+    filter: ChannelFilter,
 ) -> Io<Error, Option<(AgentEvent, LoopState<T>)>> {
     sse_step(sse_state).flat_map(move |opt| match opt {
         None => Io::pure(None),
@@ -132,6 +139,7 @@ fn step_streaming<T: Tool + Clone + Send + Sync + 'static>(
             accumulator,
             partial_text,
             history,
+            filter,
         ),
     })
 }
@@ -143,21 +151,18 @@ fn handle_event<T: Tool + Clone + Send + Sync + 'static>(
     accumulator: ToolCallAccumulator,
     partial_text: MessageBody,
     history: Vec<Message>,
+    filter: ChannelFilter,
 ) -> Io<Error, Option<(AgentEvent, LoopState<T>)>> {
     match event {
-        ChatEvent::Token(body) => {
-            let new_partial = partial_text.clone().concat(&body);
-            Io::pure(Some((
-                AgentEvent::AssistantToken(body),
-                LoopState::Streaming {
-                    agent,
-                    sse_state,
-                    accumulator,
-                    partial_text: new_partial,
-                    history,
-                },
-            )))
-        }
+        ChatEvent::Token(body) => handle_token(
+            &body,
+            sse_state,
+            agent,
+            accumulator,
+            partial_text,
+            history,
+            filter,
+        ),
         ChatEvent::ToolCallStart(idx, id, name) => {
             let new_accumulator = accumulator.add_start(idx, id, name);
             loop_step(LoopState::Streaming {
@@ -166,6 +171,7 @@ fn handle_event<T: Tool + Clone + Send + Sync + 'static>(
                 accumulator: new_accumulator,
                 partial_text,
                 history,
+                filter,
             })
         }
         ChatEvent::ToolCallArgs(idx, frag) => {
@@ -176,11 +182,51 @@ fn handle_event<T: Tool + Clone + Send + Sync + 'static>(
                 accumulator: new_accumulator,
                 partial_text,
                 history,
+                filter,
             })
         }
         ChatEvent::Finished(reason) => {
             handle_finished(reason, sse_state, agent, accumulator, partial_text, history)
         }
+    }
+}
+
+fn handle_token<T: Tool + Clone + Send + Sync + 'static>(
+    body: &MessageBody,
+    sse_state: SseState,
+    agent: StreamingAgent<T>,
+    accumulator: ToolCallAccumulator,
+    partial_text: MessageBody,
+    history: Vec<Message>,
+    filter: ChannelFilter,
+) -> Io<Error, Option<(AgentEvent, LoopState<T>)>> {
+    let (new_filter, emit_str) = filter.feed(body.as_str());
+    if emit_str.is_empty() {
+        // The raw token was entirely consumed by a marker block or a
+        // partial-marker tail.  Don't emit an `AgentEvent`; recurse into
+        // the next unfold step so the UI never sees the marker text.
+        loop_step(LoopState::Streaming {
+            agent,
+            sse_state,
+            accumulator,
+            partial_text,
+            history,
+            filter: new_filter,
+        })
+    } else {
+        let visible = MessageBody::new(emit_str);
+        let new_partial = partial_text.concat(&visible);
+        Io::pure(Some((
+            AgentEvent::AssistantToken(visible),
+            LoopState::Streaming {
+                agent,
+                sse_state,
+                accumulator,
+                partial_text: new_partial,
+                history,
+                filter: new_filter,
+            },
+        )))
     }
 }
 

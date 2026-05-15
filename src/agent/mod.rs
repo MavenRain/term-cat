@@ -2,12 +2,14 @@
 
 pub mod accumulator;
 pub mod builtin;
+pub mod channel_filter;
 pub mod event;
 pub mod loop_state;
 pub mod streaming;
 
 pub use accumulator::{PendingCall, ToolCallAccumulator};
 pub use builtin::{BuiltinTool, EchoTool, NowTool};
+pub use channel_filter::ChannelFilter;
 pub use event::{AgentEvent, ChatEvent};
 pub use loop_state::{LoopState, loop_step};
 pub use streaming::StreamingAgent;
